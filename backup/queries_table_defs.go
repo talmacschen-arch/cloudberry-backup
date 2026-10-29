@@ -602,10 +602,24 @@ func GetPartitionAlteredSchema(connectionPool *dbconn.DBConn) map[uint32][]Alter
 
 func GetTableStorage(connectionPool *dbconn.DBConn) (map[uint32]string, map[uint32]string) {
 	gplog.Info("Getting storage information")
+	// A single reloption is stored as a "name=value" element. Some storage
+	// options (e.g. PAX minmax_columns/cluster_columns) carry a comma-separated
+	// list as their value, so the value itself contains commas. A plain
+	// array_to_string(reloptions, ', ') would make those embedded commas
+	// indistinguishable from the separator between options, and the restored
+	// DDL fails with `unrecognized parameter "<second column>"`. Single-quote
+	// the value of any option whose value contains a comma so the list is
+	// preserved as one value on restore. Options without a comma are emitted
+	// unchanged to keep backup output stable.
 	query := fmt.Sprintf(`
 	SELECT c.oid,
 		quote_ident(t.spcname) AS tablespace,
-		array_to_string(reloptions, ', ') AS reloptions
+		array_to_string(ARRAY(
+			SELECT CASE WHEN position(',' in opt) > 0
+				THEN left(opt, position('=' in opt) - 1) || '=' || quote_literal(substr(opt, position('=' in opt) + 1))
+				ELSE opt
+			END
+			FROM unnest(reloptions) AS opt), ', ') AS reloptions
 	FROM pg_class c
 		JOIN pg_namespace n ON c.relnamespace = n.oid
 		LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace

@@ -846,6 +846,32 @@ SET SUBPARTITION TEMPLATE
 				Expect(result[oid]).To(Equal("blocksize=32768, compresslevel=0, compresstype=none, checksum=true"))
 			}
 		})
+		It("single-quotes comma-containing storage option values so PAX multi-column options restore correctly ", func() {
+			// PAX minmax_columns/cluster_columns store a comma-separated column
+			// list as a single string value. If that value is emitted unquoted,
+			// the embedded comma is read as an option separator and the restored
+			// DDL fails with `unrecognized parameter "<second column>"`. The value
+			// must be single-quoted so it survives the round trip.
+			if !connectionPool.Version.IsCBDB() {
+				Skip("PAX access method is only available on Cloudberry")
+			}
+			testhelper.AssertQueryRuns(connectionPool,
+				"CREATE TABLE public.pax_mm(a int, b int, c int) USING pax WITH (minmax_columns='a,b', cluster_columns='a,b', cluster_type='lexical') DISTRIBUTED BY (a)")
+			defer testhelper.AssertQueryRuns(connectionPool, "DROP TABLE public.pax_mm")
+			oid := testutils.OidFromObjectName(connectionPool, "public", "pax_mm", backup.TYPE_RELATION)
+
+			_, result := backup.GetTableStorage(connectionPool)
+
+			// The comma-containing list values must be single-quoted ...
+			Expect(result[oid]).To(ContainSubstring("minmax_columns='a,b'"))
+			Expect(result[oid]).To(ContainSubstring("cluster_columns='a,b'"))
+
+			// ... and the emitted WITH clause must restore verbatim. This asserts
+			// the wiring end to end: a failure to quote would make this CREATE fail.
+			testhelper.AssertQueryRuns(connectionPool,
+				fmt.Sprintf("CREATE TABLE public.pax_mm_restored(a int, b int, c int) USING pax WITH (%s) DISTRIBUTED BY (a)", result[oid]))
+			testhelper.AssertQueryRuns(connectionPool, "DROP TABLE public.pax_mm_restored")
+		})
 	})
 	Describe("GetTableInheritance", func() {
 		child := backup.Relation{Schema: "public", Name: "child"}
