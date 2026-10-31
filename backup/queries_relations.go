@@ -384,6 +384,29 @@ func (v View) ObjectType() string {
 	return toc.OBJ_VIEW
 }
 
+// relOptionsWithClause returns a SQL expression that renders the given
+// pg_class.reloptions column as a " WITH (...)" clause for a CREATE statement.
+// A single reloption is stored as a "name=value" element; a value that is not a
+// simple token (lowercase letters, digits, '_' or '.') is single-quoted so that
+// comma-separated, uppercase or spaced values survive the backup/restore round
+// trip. The prime example is a PAX materialized view's minmax_columns /
+// cluster_columns, whose comma-separated column list would otherwise be read as
+// the separator between options and fail restore with `unrecognized parameter`.
+// Plain-token values (e.g. compresstype=zstd) are emitted unchanged, and the
+// expression yields '' when reloptions is NULL. WITH ORDINALITY preserves the
+// original option order.
+func relOptionsWithClause(reloptionsCol string) string {
+	return fmt.Sprintf(`CASE WHEN %[1]s IS NULL THEN ''
+			ELSE ' WITH (' || array_to_string(ARRAY(
+				SELECT CASE WHEN substr(opt, position('=' in opt) + 1) ~ '^[a-z0-9_.]+$'
+					THEN opt
+					ELSE left(opt, position('=' in opt) - 1) || '=' || quote_literal(substr(opt, position('=' in opt) + 1))
+				END
+				FROM unnest(%[1]s) WITH ORDINALITY AS u(opt, n)
+				ORDER BY n), ', ') || ')'
+		END`, reloptionsCol)
+}
+
 // This function retrieves both regular views and materialized views.
 func GetAllViews(connectionPool *dbconn.DBConn) []View {
 	columnDefs := GetColumnDefinitions(connectionPool)
@@ -413,13 +436,15 @@ func GetAllViews(connectionPool *dbconn.DBConn) []View {
 
 	// Materialized views were introduced in GPDB 7 and backported to GPDB 6.2.
 	// Reloptions and tablespace added to pg_class in GPDB 6
+	optionsExpr := relOptionsWithClause("c.reloptions")
+
 	version6Query := fmt.Sprintf(`
 	SELECT
 		c.oid AS oid,
 		quote_ident(n.nspname) AS schema,
 		quote_ident(c.relname) AS name,
 		pg_get_viewdef(c.oid) AS definition,
-		coalesce(' WITH (' || array_to_string(c.reloptions, ', ') || ')', '') AS options,
+		%s AS options,
 		coalesce(quote_ident(t.spcname), '') AS tablespace,
 		c.relkind='m' AS ismaterialized
 	FROM pg_class c
@@ -427,7 +452,7 @@ func GetAllViews(connectionPool *dbconn.DBConn) []View {
 		LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
 	WHERE c.relkind IN ('m', 'v')
 		AND %s
-		AND %s`, relationAndSchemaFilterClause(), ExtensionFilterClause("c"))
+		AND %s`, optionsExpr, relationAndSchemaFilterClause(), ExtensionFilterClause("c"))
 
 	atLeast7Query := fmt.Sprintf(`
 	SELECT
@@ -435,7 +460,7 @@ func GetAllViews(connectionPool *dbconn.DBConn) []View {
 		quote_ident(n.nspname) AS schema,
 		quote_ident(c.relname) AS name,
 		pg_get_viewdef(c.oid) AS definition,
-		coalesce(' WITH (' || array_to_string(c.reloptions, ', ') || ')', '') AS options,
+		%s AS options,
 		coalesce(quote_ident(t.spcname), '') AS tablespace,
 		c.relkind='m' AS ismaterialized,
 		coalesce(quote_ident(am.amname), '') AS accessmethodname
@@ -445,7 +470,7 @@ func GetAllViews(connectionPool *dbconn.DBConn) []View {
 		LEFT JOIN pg_am am ON am.oid = c.relam
 	WHERE c.relkind IN ('m', 'v')
 		AND %s
-		AND %s`, relationAndSchemaFilterClause(), ExtensionFilterClause("c"))
+		AND %s`, optionsExpr, relationAndSchemaFilterClause(), ExtensionFilterClause("c"))
 
 	query := ""
 	if connectionPool.Version.IsGPDB() && connectionPool.Version.Before("6") {

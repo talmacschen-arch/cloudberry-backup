@@ -2,6 +2,7 @@ package integration
 
 import (
 	"database/sql"
+	"fmt"
 	"math"
 	"sort"
 	"strconv"
@@ -552,6 +553,41 @@ PARTITION BY LIST (gender)
 			}
 			Expect(results).To(HaveLen(1))
 			structmatcher.ExpectStructsToMatchExcluding(&materialView, &results[0], "Oid", "ColumnDefs", "DistPolicy.Oid")
+		})
+		It("single-quotes comma-containing storage option values for PAX materialized views", func() {
+			// PAX minmax_columns/cluster_columns store a comma-separated column
+			// list as a single string value. Emitted unquoted, the embedded comma
+			// is read as an option separator and the restored matview DDL fails
+			// with `unrecognized parameter "<second column>"`. The value must be
+			// single-quoted so the WITH clause survives the round trip.
+			if !connectionPool.Version.IsCBDB() {
+				Skip("PAX access method is only available on Cloudberry")
+			}
+			testhelper.AssertQueryRuns(connectionPool,
+				"CREATE TABLE public.pax_mv_base(a int, b int, c int) DISTRIBUTED BY (a)")
+			defer testhelper.AssertQueryRuns(connectionPool, "DROP TABLE public.pax_mv_base CASCADE")
+			testhelper.AssertQueryRuns(connectionPool,
+				"CREATE MATERIALIZED VIEW public.pax_mv USING pax WITH (minmax_columns='a,b', cluster_columns='a,b', cluster_type='lexical') AS SELECT * FROM public.pax_mv_base DISTRIBUTED BY (a)")
+			defer testhelper.AssertQueryRuns(connectionPool, "DROP MATERIALIZED VIEW public.pax_mv")
+
+			results := backup.GetAllViews(connectionPool)
+			var mv backup.View
+			for _, v := range results {
+				if v.Name == "pax_mv" {
+					mv = v
+				}
+			}
+
+			// The comma-containing list values must be single-quoted ...
+			Expect(mv.Options).To(ContainSubstring("minmax_columns='a,b'"))
+			Expect(mv.Options).To(ContainSubstring("cluster_columns='a,b'"))
+
+			// ... and the emitted WITH clause must recreate the matview verbatim.
+			// This asserts the wiring end to end: a failure to quote would make
+			// this CREATE MATERIALIZED VIEW fail.
+			testhelper.AssertQueryRuns(connectionPool,
+				fmt.Sprintf("CREATE MATERIALIZED VIEW public.pax_mv_restored USING pax%s AS SELECT * FROM public.pax_mv_base DISTRIBUTED BY (a)", mv.Options))
+			testhelper.AssertQueryRuns(connectionPool, "DROP MATERIALIZED VIEW public.pax_mv_restored")
 		})
 	})
 })
