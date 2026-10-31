@@ -602,24 +602,30 @@ func GetPartitionAlteredSchema(connectionPool *dbconn.DBConn) map[uint32][]Alter
 
 func GetTableStorage(connectionPool *dbconn.DBConn) (map[uint32]string, map[uint32]string) {
 	gplog.Info("Getting storage information")
-	// A single reloption is stored as a "name=value" element. Some storage
-	// options (e.g. PAX minmax_columns/cluster_columns) carry a comma-separated
-	// list as their value, so the value itself contains commas. A plain
-	// array_to_string(reloptions, ', ') would make those embedded commas
-	// indistinguishable from the separator between options, and the restored
-	// DDL fails with `unrecognized parameter "<second column>"`. Single-quote
-	// the value of any option whose value contains a comma so the list is
-	// preserved as one value on restore. Options without a comma are emitted
-	// unchanged to keep backup output stable.
+	// A single reloption is stored as a "name=value" element and the WITH clause
+	// is built by joining them with ", ". A value that is not a plain token
+	// (lowercase letters, digits, '_' or '.') breaks that round trip:
+	//   - PAX minmax_columns/cluster_columns carry a comma-separated column list,
+	//     e.g. "minmax_columns=a,b"; the embedded comma is read as the separator
+	//     between options and restore fails with `unrecognized parameter "b"`.
+	//   - an identifier with uppercase or special characters is silently
+	//     downcased ("minmax_columns=A" targets column "a"), and a value with a
+	//     space is a syntax error ("minmax_columns=x y").
+	// Single-quote the value of any option whose value is not a simple token so
+	// it survives verbatim on restore. Plain-token values (compresstype=zstd,
+	// compresslevel=5, fillfactor=70, checksum=true, ...) are emitted unchanged,
+	// so backup output for existing tables is byte-for-byte unaffected. WITH
+	// ORDINALITY preserves the original option order.
 	query := fmt.Sprintf(`
 	SELECT c.oid,
 		quote_ident(t.spcname) AS tablespace,
 		array_to_string(ARRAY(
-			SELECT CASE WHEN position(',' in opt) > 0
-				THEN left(opt, position('=' in opt) - 1) || '=' || quote_literal(substr(opt, position('=' in opt) + 1))
-				ELSE opt
+			SELECT CASE WHEN substr(opt, position('=' in opt) + 1) ~ '^[a-z0-9_.]+$'
+				THEN opt
+				ELSE left(opt, position('=' in opt) - 1) || '=' || quote_literal(substr(opt, position('=' in opt) + 1))
 			END
-			FROM unnest(reloptions) AS opt), ', ') AS reloptions
+			FROM unnest(reloptions) WITH ORDINALITY AS u(opt, n)
+			ORDER BY n), ', ') AS reloptions
 	FROM pg_class c
 		JOIN pg_namespace n ON c.relnamespace = n.oid
 		LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace

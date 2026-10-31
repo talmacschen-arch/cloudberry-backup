@@ -872,6 +872,33 @@ SET SUBPARTITION TEMPLATE
 				fmt.Sprintf("CREATE TABLE public.pax_mm_restored(a int, b int, c int) USING pax WITH (%s) DISTRIBUTED BY (a)", result[oid]))
 			testhelper.AssertQueryRuns(connectionPool, "DROP TABLE public.pax_mm_restored")
 		})
+		It("single-quotes storage option values that are not simple tokens (uppercase, spaces) so they restore correctly", func() {
+			// A storage option value that is not a plain token also breaks the
+			// round trip even without a comma: an uppercase identifier is silently
+			// downcased (minmax_columns=A targets column "a"), and a value with a
+			// space is a syntax error (bloomfilter_columns=x y). Both must be
+			// single-quoted so the value survives verbatim on restore.
+			if !connectionPool.Version.IsCBDB() {
+				Skip("PAX access method is only available on Cloudberry")
+			}
+			testhelper.AssertQueryRuns(connectionPool,
+				`CREATE TABLE public.pax_q(a int, "A" int, "x y" int) USING pax WITH (minmax_columns='A', bloomfilter_columns='x y') DISTRIBUTED BY (a)`)
+			defer testhelper.AssertQueryRuns(connectionPool, "DROP TABLE public.pax_q")
+			oid := testutils.OidFromObjectName(connectionPool, "public", "pax_q", backup.TYPE_RELATION)
+
+			_, result := backup.GetTableStorage(connectionPool)
+
+			// The non-token values must be single-quoted ...
+			Expect(result[oid]).To(ContainSubstring("minmax_columns='A'"))
+			Expect(result[oid]).To(ContainSubstring("bloomfilter_columns='x y'"))
+
+			// ... and the emitted WITH clause must restore verbatim onto the same
+			// uppercase/spaced columns. Without quoting this CREATE would downcase
+			// "A" to a missing column or fail with a syntax error.
+			testhelper.AssertQueryRuns(connectionPool,
+				fmt.Sprintf(`CREATE TABLE public.pax_q_restored(a int, "A" int, "x y" int) USING pax WITH (%s) DISTRIBUTED BY (a)`, result[oid]))
+			testhelper.AssertQueryRuns(connectionPool, "DROP TABLE public.pax_q_restored")
+		})
 	})
 	Describe("GetTableInheritance", func() {
 		child := backup.Relation{Schema: "public", Name: "child"}
